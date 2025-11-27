@@ -24,15 +24,14 @@ if __name__ == '__main__':
     folder_in = 'input'
     folder_out = 'output'
 
-    filename_input = 'image.jpg'
-    filename_output = 'image_result.png'
+    filename_input = 'Broadway_tower_edit.jpg'
     filename_mask = 'mask.jpg'
-    new_height = 200
-    new_width = 512
+    new_height = 2*968 / 3
+    new_width = 2*1428 / 3
 
     input_image = os.path.join(folder_in, filename_input)
     input_mask = os.path.join(folder_in, filename_mask)
-    output_image = os.path.join(folder_out, filename_output)
+    output_image = os.path.join(folder_out, "result_"+filename_input)
 
     print("Processing...")
 

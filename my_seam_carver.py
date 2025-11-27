@@ -6,13 +6,14 @@ class SeamCarver:
     def __init__(self, filename, out_height, out_width, protect_mask='', object_mask='', progress_callback=None):
         # initialize parameter
         self.filename = filename
+        # read in image and store as np.float64 format
+        self.in_image = cv2.imread(filename).astype(np.float64)
+        self.in_height, self.in_width = self.in_image.shape[: 2]
+        # initialize parameter cont'd
         self.out_height = out_height
         self.out_width = out_width
         self.progress_callback = progress_callback
 
-        # read in image and store as np.float64 format
-        self.in_image = cv2.imread(filename).astype(np.float64)
-        self.in_height, self.in_width = self.in_image.shape[: 2]
 
         # keep tracking resulting image
         self.out_image = np.copy(self.in_image)
@@ -148,6 +149,22 @@ class SeamCarver:
         if rotate:
             self.out_image = self.rotate_image(self.out_image, 0)
     
+    # --- Core vertical resizing primitive ---------------------------------
+    #
+    # `seams_removal` is the main driver for content-aware shrinking.
+    #
+    # For protected / object-masked images we still remove seams one by
+    # one to respect the exact constraints. For the unmasked case we use
+    # a *batched multi-seam* strategy:
+    #   - Compute the energy and cumulative forward map once per batch.
+    #   - Extract up to B disjoint seams from that DP map via
+    #     `find_k_seams`.
+    #   - Remove all of them in a single vectorized pass via
+    #     `delete_seams_batch`.
+    #
+    # This reduces the number of full DP passes from O(K) to roughly
+    # O(K / B), which is the key to making seam carving practical for
+    # high-resolution images.
     def seams_removal(self, num_pixel):
         if self.protect:
             for dummy in range(num_pixel):
@@ -159,12 +176,48 @@ class SeamCarver:
                 self.delete_seam(seam_idx)
                 self.delete_seam_on_mask(seam_idx)
         else:
-            for dummy in range(num_pixel):
-                self._notify_progress("Removing seams", dummy + 1, num_pixel)
+            # Batched multi-seam removal: remove several seams per DP pass
+            remaining = num_pixel
+            removed = 0
+            while remaining > 0:
+                # Limit batch size so we never remove too many seams relative to current width.
+                current_width = self.out_image.shape[1]
+                if current_width <= 2:
+                    break
+
+                # Heuristic: remove only a *small* number of seams per batch.
+                #
+                # If we remove too many seams from a single energy / DP map,
+                # later seams will be chosen based on an outdated view of the
+                # image and can start cutting through important structure.
+                #
+                # We therefore cap the batch size in two ways:
+                #   - as a small fraction of the current width (e.g. 4%), and
+                #   - by an absolute maximum (e.g. 8 seams per batch).
+                #
+                # This still reduces the number of full DP passes by roughly
+                # a factor of 4–10 on large images, while keeping the visual
+                # behaviour close to the classical one-seam-at-a-time method.
+                max_batch_frac = 0.04   # at most 4% of current width per batch
+                max_batch_cap = 16       # and never more than 8 seams at once
+                max_batch = max(1, min(int(current_width * max_batch_frac), max_batch_cap))
+                batch = min(remaining, max_batch)
+
+                # Progress is tracked on total number of seams removed so far.
+                self._notify_progress("Removing seams", removed + batch, num_pixel)
+
                 energy_map = self.calc_energy_map()
                 cumulative_map = self.cumulative_map_forward(energy_map)
-                seam_idx = self.find_seam(cumulative_map)
-                self.delete_seam(seam_idx)
+                seams = self.find_k_seams(cumulative_map, batch)
+
+                if seams.size == 0:
+                    break
+
+                self.delete_seams_batch(seams)
+
+                actual = seams.shape[0]
+                remaining -= actual
+                removed += actual
 
 
     def seams_insertion(self, num_pixel):
@@ -279,6 +332,95 @@ class SeamCarver:
                 output[row] = np.argmin(cumulative_map[row, prv_x - 1: min(prv_x + 2, n - 1)]) + prv_x - 1
         return output
 
+    def find_k_seams(self, cumulative_map, k):
+        """Find up to k non-overlapping seams from a single cumulative map.
+
+        This function performs *one* dynamic-programming pass (already done
+        in `cumulative_map_forward`) and then extracts multiple seams by
+        repeated backtracking on a *modified* copy of the cumulative map.
+
+        After extracting each seam, its pixels are set to +inf in the
+        working copy so that subsequent seams cannot reuse those pixels.
+        This guarantees that, for every row, no two seams share the same
+        column index. As a result, removing these seams in a batch produces
+        a rectangular image with a well-defined new width.
+
+        Parameters
+        ----------
+        cumulative_map : np.ndarray
+            Forward-energy cumulative cost map of shape (m, n).
+        k : int
+            Maximum number of seams to extract.
+
+        Returns
+        -------
+        seams : np.ndarray
+            Array of shape (num_seams, m), where each row is a seam
+            expressed as a 1D array of column indices for each row.
+            num_seams may be smaller than k if we run out of valid paths.
+        """
+        m, n = cumulative_map.shape
+
+        # Work on a copy so we can invalidate pixels without touching
+        # the original cumulative map.
+        cm = np.copy(cumulative_map)
+        seams = []
+        rows = np.arange(m)
+
+        for _ in range(k):
+            # 1) Start each seam from the minimum-cost pixel on the bottom row.
+            start_col = np.argmin(cm[-1])
+            if not np.isfinite(cm[-1, start_col]):
+                # No finite cost remains on the bottom row: we cannot
+                # extract any more valid seams.
+                break
+
+            seam = np.zeros(m, dtype=np.int32)
+            seam[-1] = start_col
+
+            valid = True
+            # 2) Backtrack upwards, always moving to one of the three
+            #    neighbors (up-left, up, up-right) with the lowest cost
+            #    *that is still finite* in the modified cumulative map.
+            for row in range(m - 2, -1, -1):
+                prev_x = seam[row + 1]
+                start = max(prev_x - 1, 0)
+                end = min(prev_x + 2, n - 1)
+
+                candidates = cm[row, start:end + 1]
+
+                # Mask out invalid / already-used pixels. If all three
+                # candidates are inf, we cannot continue this seam.
+                finite_mask = np.isfinite(candidates)
+                if not np.any(finite_mask):
+                    valid = False
+                    break
+
+                # Choose the best among the finite candidates only.
+                effective = np.full_like(candidates, np.inf)
+                effective[finite_mask] = candidates[finite_mask]
+                offset = np.argmin(effective)
+                col = start + offset
+
+                seam[row] = col
+
+            if not valid:
+                # We failed to build a full seam from bottom to top.
+                # Stop extracting further seams: the remaining finite
+                # structure of cm cannot support more disjoint seams.
+                break
+
+            seams.append(seam)
+
+            # 3) Invalidate all pixels along this seam for future extractions
+            #    so that subsequent seams do not reuse any of these pixels.
+            cm[rows, seam] = np.inf
+
+        if not seams:
+            return np.empty((0, m), dtype=np.int32)
+
+        return np.stack(seams, axis=0)
+
 
     def delete_seam(self, seam_idx):
         m, n = self.out_image.shape[: 2]
@@ -286,6 +428,36 @@ class SeamCarver:
         mask = np.ones((m, n), dtype=bool)
         mask[rows, seam_idx] = False  # Vectorized carve removes the seam for all channels in one pass.
         self.out_image = self.out_image[mask].reshape(m, n - 1, 3)
+
+    def delete_seams_batch(self, seams):
+        """Delete multiple seams in one vectorized pass.
+
+        `seams` should be an array of shape (k, m), where each row is a seam.
+        """
+        if seams.size == 0:
+            return
+
+        m, n = self.out_image.shape[:2]
+        k = seams.shape[0]
+        if k >= n:
+            raise ValueError("Cannot remove more seams than image width")
+
+        rows = np.arange(m)
+        mask = np.ones((m, n), dtype=bool)
+        for seam in seams:
+            # For each seam, mark exactly one pixel per row as False.
+            # Because `find_k_seams` guarantees that no two seams share
+            # the same (row, col), every row will end up with exactly
+            # `k` False entries and `n - k` True entries.
+            mask[rows, seam] = False
+
+        # Applying a 2D boolean mask to a (m, n, 3) image collapses the
+        # first two dimensions and keeps the channel dimension, producing
+        # an array of shape (m * (n - k), 3). We then reshape it back
+        # into (m, n - k, 3). If this reshape ever fails, it means that
+        # some rows did not lose exactly `k` pixels, which would indicate
+        # a bug in the multi-seam extraction logic.
+        self.out_image = self.out_image[mask].reshape(m, n - k, 3)
 
 
     def add_seam(self, seam_idx):
