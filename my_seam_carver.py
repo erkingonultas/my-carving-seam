@@ -199,7 +199,7 @@ class SeamCarver:
                 # a factor of 4–10 on large images, while keeping the visual
                 # behaviour close to the classical one-seam-at-a-time method.
                 max_batch_frac = 0.04   # at most 4% of current width per batch
-                max_batch_cap = 16       # and never more than 8 seams at once
+                max_batch_cap = 64       # and never more than 8 seams at once
                 max_batch = max(1, min(int(current_width * max_batch_frac), max_batch_cap))
                 batch = min(remaining, max_batch)
 
