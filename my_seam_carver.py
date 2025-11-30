@@ -227,7 +227,7 @@ class SeamCarver:
             seams_record = []
 
             for dummy in range(num_pixel):
-                self._notify_progress("Recording seams for insertion", dummy + 1, num_pixel)
+                self._notify_progress("Recording seams for insertion (protected)", dummy + 1, num_pixel)
                 energy_map = self.calc_energy_map()
                 energy_map[np.where(self.mask[:, :] > 0)] *= self.constant
                 cumulative_map = self.cumulative_map_backward(energy_map)
@@ -246,21 +246,82 @@ class SeamCarver:
                 self.add_seam_on_mask(seam)
                 seams_record = self.update_seams(seams_record, seam)
         else:
+            # --- Batched seam insertion (unprotected case) -----------------
+            #
+            # We record seams to be inserted by repeatedly running a
+            # *backward* dynamic program on the current image, but instead of
+            # taking exactly one seam per DP pass, we take a small batch of
+            # non-overlapping seams using `find_k_seams_backward`.
+            #
+            # Within each batch we still delete seams one by one and update
+            # the remaining seams' indices so that the recorded sequence is
+            # equivalent to the classic one-seam-at-a-time algorithm, while
+            # requiring far fewer DP passes overall.
             temp_image = np.copy(self.out_image)
             seams_record = []
+            remaining = num_pixel
+            recorded = 0
 
-            for dummy in range(num_pixel):
-                self._notify_progress("Recording seams for insertion", dummy + 1, num_pixel)
+            while remaining > 0:
+                m, n = self.out_image.shape[:2]
+                if n <= 2:
+                    break
+
+                # Conservative batch size: small fraction of width, capped.
+                max_batch_frac = 0.04   # at most 4% of current width
+                max_batch_cap = 8       # and never more than 8 seams per batch
+                max_batch = max(1, min(int(n * max_batch_frac), max_batch_cap))
+                batch = min(remaining, max_batch)
+
+                # Backward DP for this batch.
+                self._notify_progress(
+                    "Recording seams for insertion (unprotected)",
+                    min(recorded + batch, num_pixel),
+                    num_pixel
+                )
                 energy_map = self.calc_energy_map()
                 cumulative_map = self.cumulative_map_backward(energy_map)
-                seam_idx = self.find_seam(cumulative_map)
-                seams_record.append(seam_idx)
-                self.delete_seam(seam_idx)
 
+                seams_batch = self.find_k_seams_backward(cumulative_map, batch)
+                if seams_batch.size == 0:
+                    break
+
+                # Process each seam in the batch sequentially, updating the
+                # remaining seams' indices after each deletion so that their
+                # coordinates stay consistent with the current (shrinking)
+                # image geometry.
+                k_batch = seams_batch.shape[0]
+                for i in range(k_batch):
+                    seam = seams_batch[i]
+                    seams_record.append(seam.copy())
+                    self.delete_seam(seam)
+
+                    # Update the remaining seams in this batch to account for
+                    # the column shift caused by removing `seam`. For each
+                    # later seam, any column index at or to the right of the
+                    # removed pixel in a given row must shift left by 1.
+                    if i + 1 < k_batch:
+                        later = seams_batch[i + 1:]
+                        # Vectorised per-row shift for all remaining seams.
+                        # shape later: (k_remaining, m)
+                        # broadcast seam (m,) against (k_remaining, m)
+                        mask = later >= seam  # compare per row
+                        later[mask] -= 1
+
+                    recorded += 1
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+
+            # Replay insertion on the original unmodified image. We restore
+            # the original image and then insert seams in the same order they
+            # were recorded. `update_seams` adjusts the indices of yet-to-be
+            # inserted seams so that each new seam is applied to the current
+            # (expanding) geometry.
             self.out_image = np.copy(temp_image)
             n = len(seams_record)
-            for dummy in range(n):
-                self._notify_progress("Inserting seams", dummy + 1, n)
+            for idx in range(n):
+                self._notify_progress("Inserting seams", idx + 1, n)
                 seam = seams_record.pop(0)
                 self.add_seam(seam)
                 seams_record = self.update_seams(seams_record, seam)
@@ -421,6 +482,61 @@ class SeamCarver:
 
         return np.stack(seams, axis=0)
 
+    def find_k_seams_backward(self, cumulative_map, k):
+        """Find up to k non-overlapping seams from a backward DP map.
+
+        This is the backward-DP analogue of `find_k_seams` and is used
+        when we are recording seams for insertion. It assumes that
+        `cumulative_map` has already been computed by
+        `cumulative_map_backward` and then repeatedly backtracks seams,
+        invalidating used pixels by setting them to +inf.
+        """
+        m, n = cumulative_map.shape
+        cm = np.copy(cumulative_map)
+        seams = []
+        rows = np.arange(m)
+
+        for _ in range(k):
+            # Start from the best pixel on the bottom row in the current map
+            start_col = np.argmin(cm[-1])
+            if not np.isfinite(cm[-1, start_col]):
+                break
+
+            seam = np.zeros(m, dtype=np.int32)
+            seam[-1] = start_col
+            valid = True
+
+            # Backtrack upwards through the three neighbors (up-left, up,
+            # up-right), always choosing the finite neighbor with minimum
+            # cumulative cost.
+            for row in range(m - 2, -1, -1):
+                prev_x = seam[row + 1]
+                start = max(prev_x - 1, 0)
+                end = min(prev_x + 2, n - 1)
+
+                candidates = cm[row, start:end + 1]
+                finite_mask = np.isfinite(candidates)
+                if not np.any(finite_mask):
+                    valid = False
+                    break
+
+                effective = np.full_like(candidates, np.inf)
+                effective[finite_mask] = candidates[finite_mask]
+                offset = np.argmin(effective)
+                seam[row] = start + offset
+
+            if not valid:
+                break
+
+            seams.append(seam)
+            # Invalidate the pixels along this seam so future seams do not
+            # reuse the same (row, col) positions.
+            cm[rows, seam] = np.inf
+
+        if not seams:
+            return np.empty((0, m), dtype=np.int32)
+
+        return np.stack(seams, axis=0)
 
     def delete_seam(self, seam_idx):
         m, n = self.out_image.shape[: 2]
