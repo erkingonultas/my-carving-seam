@@ -268,7 +268,7 @@ class SeamCarver:
                     break
 
                 # Conservative batch size: small fraction of width, capped.
-                max_batch_frac = 0.04   # at most 4% of current width
+                max_batch_frac = 0.02   # at most 4% of current width
                 max_batch_cap = 8       # and never more than 8 seams per batch
                 max_batch = max(1, min(int(n * max_batch_frac), max_batch_cap))
                 batch = min(remaining, max_batch)
@@ -336,12 +336,39 @@ class SeamCarver:
 
 
     def cumulative_map_backward(self, energy_map):
+        """
+        Classic backward cumulative energy map used for seam insertion.
+
+        This is the standard dynamic program where the cost of a pixel
+        depends only on the three pixels directly above it:
+            up-left, up, up-right.
+
+        We compute the DP row-by-row, but each row update is vectorised
+        using shifted views of the previous row instead of an inner loop
+        over columns. This significantly reduces Python overhead compared
+        to the naive double loop, especially for wide images.
+        """
         m, n = energy_map.shape
         output = np.copy(energy_map)
         for row in range(1, m):
-            for col in range(n):
-                output[row, col] = \
-                    energy_map[row, col] + np.amin(output[row - 1, max(col - 1, 0): min(col + 2, n - 1)])
+            prev = output[row - 1]
+
+            # Cost coming from directly above
+            e_up = prev
+
+            # Cost coming from up-left: shift prev one to the right
+            e_left = np.empty_like(prev)
+            e_left[0] = np.inf
+            e_left[1:] = prev[:-1]
+
+            # Cost coming from up-right: shift prev one to the left
+            e_right = np.empty_like(prev)
+            e_right[-1] = np.inf
+            e_right[:-1] = prev[1:]
+
+            best = np.minimum(e_up, np.minimum(e_left, e_right))
+            output[row] = energy_map[row] + best
+
         return output
 
 
